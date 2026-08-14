@@ -338,6 +338,10 @@ def dashboard():
 
     user = current_user()
 
+    if user is None:
+        session.clear()
+        return redirect("/login")
+
     return render_template_string(
         DASHBOARD_PAGE,
         user=user
