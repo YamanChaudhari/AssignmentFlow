@@ -12,6 +12,10 @@ from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3
 import os
+import json
+import hmac
+
+from pywebpush import webpush, WebPushException
 
 
 # ============================================================
@@ -61,6 +65,34 @@ def initialize_database():
             priority TEXT NOT NULL DEFAULT 'Medium',
             status TEXT NOT NULL DEFAULT 'Pending',
             reminder_minutes INTEGER NOT NULL DEFAULT 60,
+            created_at TEXT NOT NULL,
+            reminder_sent INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id)
+                REFERENCES users(id)
+                ON DELETE CASCADE
+        )
+    """)
+
+    # Migration for existing AssignmentFlow databases.
+    columns = {
+        row[1]
+        for row in db.execute(
+            "PRAGMA table_info(assignments)"
+        ).fetchall()
+    }
+
+    if "reminder_sent" not in columns:
+        db.execute(
+            "ALTER TABLE assignments ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0"
+        )
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            endpoint TEXT NOT NULL UNIQUE,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY (user_id)
                 REFERENCES users(id)
@@ -637,9 +669,10 @@ def add_assignment():
             priority,
             status,
             reminder_minutes,
-            created_at
+            created_at,
+            reminder_sent
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session["user_id"],
@@ -652,7 +685,8 @@ def add_assignment():
             priority,
             "Pending",
             reminder_minutes,
-            now_string()
+            now_string(),
+            0
         )
     )
 
@@ -782,7 +816,8 @@ def update_assignment(
             description = ?,
             deadline = ?,
             priority = ?,
-            reminder_minutes = ?
+            reminder_minutes = ?,
+            reminder_sent = 0
         WHERE id = ?
         AND user_id = ?
         """,
@@ -1002,6 +1037,383 @@ def reminders():
 
 
 # ============================================================
+# WEB PUSH NOTIFICATIONS
+# ============================================================
+
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_SUBJECT = os.environ.get(
+    "VAPID_SUBJECT",
+    "mailto:admin@example.com"
+)
+REMINDER_CRON_SECRET = os.environ.get(
+    "REMINDER_CRON_SECRET",
+    ""
+)
+
+
+@app.route("/manifest.json")
+def manifest():
+
+    return jsonify({
+        "name": "AssignmentFlow",
+        "short_name": "AssignmentFlow",
+        "start_url": "/dashboard",
+        "display": "standalone",
+        "background_color": "#0f172a",
+        "theme_color": "#6366f1",
+        "id": "/assignmentflow"
+    })
+
+
+@app.route("/sw.js")
+def service_worker():
+
+    service_worker_code = """
+self.addEventListener("push", function(event) {
+
+    let data = {};
+
+    try {
+        data = event.data ? event.data.json() : {};
+    } catch (error) {
+        data = {
+            title: "AssignmentFlow",
+            body: event.data ? event.data.text() : "New reminder"
+        };
+    }
+
+    const title = data.title || "AssignmentFlow 🔔";
+
+    const options = {
+        body: data.body || "You have an assignment reminder.",
+        icon: "/manifest.json",
+        badge: "/manifest.json",
+        tag: data.tag || "assignmentflow-reminder",
+        data: {
+            url: data.url || "/dashboard"
+        }
+    };
+
+    event.waitUntil(
+        self.registration.showNotification(title, options)
+    );
+});
+
+self.addEventListener("notificationclick", function(event) {
+
+    event.notification.close();
+
+    const targetUrl =
+        event.notification.data &&
+        event.notification.data.url
+            ? event.notification.data.url
+            : "/dashboard";
+
+    event.waitUntil(
+        clients.matchAll({
+            type: "window",
+            includeUncontrolled: true
+        }).then(function(clientList) {
+
+            for (const client of clientList) {
+                if ("focus" in client) {
+                    client.focus();
+                    return;
+                }
+            }
+
+            if (clients.openWindow) {
+                return clients.openWindow(targetUrl);
+            }
+        })
+    );
+});
+"""
+
+    return service_worker_code, 200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-cache"
+    }
+
+
+@app.route("/api/push/public-key")
+def push_public_key():
+
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({
+            "success": False,
+            "message": "VAPID public key is not configured."
+        }), 503
+
+    return jsonify({
+        "success": True,
+        "publicKey": VAPID_PUBLIC_KEY
+    })
+
+
+@app.route("/api/push/subscribe", methods=["POST"])
+@login_required
+def push_subscribe():
+
+    data = request.get_json(silent=True) or {}
+    endpoint = str(data.get("endpoint", "")).strip()
+    keys = data.get("keys") or {}
+    p256dh = str(keys.get("p256dh", "")).strip()
+    auth = str(keys.get("auth", "")).strip()
+
+    if not endpoint or not p256dh or not auth:
+        return jsonify({
+            "success": False,
+            "message": "Invalid push subscription."
+        }), 400
+
+    db = get_db()
+
+    db.execute("""
+        INSERT INTO push_subscriptions
+        (user_id, endpoint, p256dh, auth, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(endpoint) DO UPDATE SET
+            user_id = excluded.user_id,
+            p256dh = excluded.p256dh,
+            auth = excluded.auth,
+            created_at = excluded.created_at
+    """, (
+        session["user_id"],
+        endpoint,
+        p256dh,
+        auth,
+        now_string()
+    ))
+
+    db.commit()
+    db.close()
+
+    return jsonify({
+        "success": True,
+        "message": "Push notifications enabled."
+    })
+
+
+@app.route("/api/push/unsubscribe", methods=["POST"])
+@login_required
+def push_unsubscribe():
+
+    data = request.get_json(silent=True) or {}
+    endpoint = str(data.get("endpoint", "")).strip()
+
+    if endpoint:
+        db = get_db()
+        db.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?",
+            (endpoint, session["user_id"])
+        )
+        db.commit()
+        db.close()
+
+    return jsonify({"success": True})
+
+
+def send_push_notification(subscription, payload):
+
+    if not VAPID_PRIVATE_KEY or not VAPID_SUBJECT:
+        raise RuntimeError("VAPID configuration is missing.")
+
+    subscription_info = {
+        "endpoint": subscription["endpoint"],
+        "keys": {
+            "p256dh": subscription["p256dh"],
+            "auth": subscription["auth"]
+        }
+    }
+
+    webpush(
+        subscription_info=subscription_info,
+        data=json.dumps(payload),
+        vapid_private_key=VAPID_PRIVATE_KEY,
+        vapid_claims={"sub": VAPID_SUBJECT},
+        ttl=3600
+    )
+
+
+@app.route("/api/push/test", methods=["POST"])
+@login_required
+def push_test():
+
+    if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
+        return jsonify({
+            "success": False,
+            "message": "VAPID keys are not configured on the server."
+        }), 503
+
+    db = get_db()
+    subscriptions = db.execute(
+        "SELECT * FROM push_subscriptions WHERE user_id = ?",
+        (session["user_id"],)
+    ).fetchall()
+
+    sent = 0
+
+    for subscription in subscriptions:
+        try:
+            send_push_notification(
+                subscription,
+                {
+                    "title": "AssignmentFlow 🔔",
+                    "body": "Push notifications are working!",
+                    "url": "/dashboard",
+                    "tag": "assignmentflow-test"
+                }
+            )
+            sent += 1
+        except WebPushException as error:
+            status = getattr(error.response, "status_code", None)
+            if status in (404, 410):
+                db.execute(
+                    "DELETE FROM push_subscriptions WHERE id = ?",
+                    (subscription["id"],)
+                )
+        except Exception:
+            pass
+
+    db.commit()
+    db.close()
+
+    if sent == 0:
+        return jsonify({
+            "success": False,
+            "message": "No active push subscription was found. Enable notifications first."
+        }), 400
+
+    return jsonify({
+        "success": True,
+        "message": "Test notification sent."
+    })
+
+
+@app.route("/api/process-reminders")
+def process_reminders():
+
+    supplied_secret = request.headers.get("X-Cron-Secret", "")
+
+    if not REMINDER_CRON_SECRET or not hmac.compare_digest(
+        supplied_secret,
+        REMINDER_CRON_SECRET
+    ):
+        return jsonify({"success": False, "message": "Unauthorized."}), 401
+
+    if not VAPID_PRIVATE_KEY:
+        return jsonify({
+            "success": False,
+            "message": "VAPID private key is not configured."
+        }), 503
+
+    now = datetime.now()
+    db = get_db()
+
+    assignments = db.execute("""
+        SELECT
+            a.*,
+            u.name AS user_name
+        FROM assignments a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.status = 'Pending'
+          AND a.reminder_sent = 0
+    """).fetchall()
+
+    sent_count = 0
+    expired_count = 0
+
+    for assignment in assignments:
+
+        deadline = datetime.strptime(
+            assignment["deadline"],
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        reminder_at = deadline - timedelta(
+            minutes=assignment["reminder_minutes"]
+        )
+
+        if now < reminder_at:
+            continue
+
+        if now > deadline:
+            expired_count += 1
+            continue
+
+        seconds_left = max(
+            0,
+            int((deadline - now).total_seconds())
+        )
+        minutes_left = seconds_left // 60
+
+        if minutes_left <= 0:
+            message = f"{assignment['title']} is due now."
+        elif minutes_left < 60:
+            message = (
+                f"{assignment['title']} is due in "
+                f"{minutes_left} minute(s)."
+            )
+        else:
+            hours = minutes_left // 60
+            minutes = minutes_left % 60
+            message = f"{assignment['title']} is due in {hours} hour(s)"
+            if minutes:
+                message += f" and {minutes} minute(s)"
+            message += "."
+
+        subscriptions = db.execute(
+            "SELECT * FROM push_subscriptions WHERE user_id = ?",
+            (assignment["user_id"],)
+        ).fetchall()
+
+        delivered = False
+
+        for subscription in subscriptions:
+            try:
+                send_push_notification(
+                    subscription,
+                    {
+                        "title": "AssignmentFlow 🔔",
+                        "body": (
+                            message +
+                            f" Subject: {assignment['subject']}."
+                        ),
+                        "url": "/dashboard",
+                        "tag": f"assignment-{assignment['id']}"
+                    }
+                )
+                delivered = True
+                sent_count += 1
+            except WebPushException as error:
+                status = getattr(error.response, "status_code", None)
+                if status in (404, 410):
+                    db.execute(
+                        "DELETE FROM push_subscriptions WHERE id = ?",
+                        (subscription["id"],)
+                    )
+            except Exception:
+                continue
+
+        if delivered:
+            db.execute(
+                "UPDATE assignments SET reminder_sent = 1 WHERE id = ?",
+                (assignment["id"],)
+            )
+
+    db.commit()
+    db.close()
+
+    return jsonify({
+        "success": True,
+        "sent": sent_count,
+        "expired": expired_count
+    })
+
+
+# ============================================================
 # FULL APPLICATION UI
 # ============================================================
 
@@ -1018,6 +1430,11 @@ DASHBOARD_PAGE = """
       content="width=device-width, initial-scale=1.0">
 
 <title>AssignmentFlow</title>
+
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#6366f1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="AssignmentFlow">
 
 <style>
 
@@ -2194,6 +2611,15 @@ textarea.field {
             title="Toggle theme"
         >
             🌙
+        </button>
+
+        <button
+            class="icon-btn"
+            onclick="enablePushNotifications()"
+            title="Enable notifications"
+            id="pushButton"
+        >
+            🔔
         </button>
 
 
@@ -3521,9 +3947,11 @@ async function deleteAssignment(
     }
 
 
-    localStorage.removeItem(
-        "assignment_reminder_" + id
-    );
+    Object.keys(localStorage).forEach(function(key) {
+        if (key.startsWith("assignment_toast_" + id + "_")) {
+            localStorage.removeItem(key);
+        }
+    });
 
 
     showToast(
@@ -3587,181 +4015,169 @@ async function loadStats() {
 
 
 // ============================================================
-// REMINDER SYSTEM
+// PUSH NOTIFICATIONS
 // ============================================================
 
+function urlBase64ToUint8Array(base64String) {
+
+    const padding = "=".repeat(
+        (4 - base64String.length % 4) % 4
+    );
+
+    const base64 =
+        (base64String + padding)
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+
+    const rawData = window.atob(base64);
+
+    return Uint8Array.from(
+        [...rawData].map(char => char.charCodeAt(0))
+    );
+}
+
+
+async function enablePushNotifications() {
+
+    if (!("serviceWorker" in navigator)) {
+        showToast("Push notifications are not supported here.");
+        return;
+    }
+
+    if (!("PushManager" in window)) {
+        showToast("Push notifications are not supported here.");
+        return;
+    }
+
+    try {
+
+        const registration =
+            await navigator.serviceWorker.register("/sw.js");
+
+        const permission =
+            await Notification.requestPermission();
+
+        if (permission !== "granted") {
+            showToast("Notification permission was not granted.");
+            return;
+        }
+
+        const keyResponse =
+            await fetch("/api/push/public-key");
+
+        const keyData =
+            await keyResponse.json();
+
+        if (!keyResponse.ok || !keyData.publicKey) {
+            showToast("Push notifications are not configured yet.");
+            return;
+        }
+
+        let subscription =
+            await registration.pushManager.getSubscription();
+
+        if (!subscription) {
+            subscription =
+                await registration.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey:
+                        urlBase64ToUint8Array(
+                            keyData.publicKey
+                        )
+                });
+        }
+
+        const response =
+            await fetch("/api/push/subscribe", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(
+                    subscription.toJSON()
+                )
+            });
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+            showToast(
+                data.message ||
+                "Unable to enable notifications."
+            );
+            return;
+        }
+
+        const button =
+            document.getElementById("pushButton");
+
+        if (button) {
+            button.textContent = "🔔✓";
+            button.title = "Notifications enabled";
+        }
+
+        showToast("🔔 Notifications enabled!");
+
+    } catch (error) {
+
+        console.error(
+            "Push notification setup failed:",
+            error
+        );
+
+        showToast(
+            "Unable to enable notifications."
+        );
+    }
+}
+
+
 async function checkReminders() {
-
-    if (
-        !("Notification" in window)
-    ) {
-
-        return;
-
-    }
-
-
-    if (
-        Notification.permission ===
-        "default"
-    ) {
-
-        await Notification.requestPermission();
-
-    }
-
-
-    if (
-        Notification.permission !==
-        "granted"
-    ) {
-
-        return;
-
-    }
-
 
     try {
 
         const response =
-            await fetch(
-                "/api/reminders"
-            );
-
+            await fetch("/api/reminders");
 
         if (!response.ok) {
-
             return;
-
         }
-
 
         const reminders =
             await response.json();
-
 
         reminders.forEach(
             reminder => {
 
                 const key =
-                    "assignment_reminder_" +
-                    reminder.id +
-                    "_" +
+                    "assignment_toast_" +
+                    reminder.id + "_" +
                     reminder.reminder_minutes;
 
-
-                if (
-                    localStorage.getItem(
-                        key
-                    )
-                ) {
-
+                if (localStorage.getItem(key)) {
                     return;
-
                 }
-
-
-                let message;
-
-
-                if (
-                    reminder.minutes_left <= 0
-                ) {
-
-                    message =
-                        `${reminder.title} is due now.`;
-
-                }
-
-                else if (
-                    reminder.minutes_left < 60
-                ) {
-
-                    message =
-                        `${reminder.title} is due in `
-                        +
-                        `${reminder.minutes_left} minutes.`;
-
-                }
-
-                else {
-
-                    const hours =
-                        Math.floor(
-                            reminder.minutes_left /
-                            60
-                        );
-
-
-                    const minutes =
-                        reminder.minutes_left %
-                        60;
-
-
-                    message =
-                        `${reminder.title} is due in `
-                        +
-                        `${hours} hour(s)`;
-
-
-                    if (
-                        minutes > 0
-                    ) {
-
-                        message +=
-                            ` and ${minutes} minute(s)`;
-
-                    }
-
-                    message += ".";
-
-                }
-
-
-                new Notification(
-                    "AssignmentFlow 🔔",
-                    {
-
-                        body:
-                            message
-                            +
-                            `\nSubject: `
-                            +
-                            reminder.subject
-                            +
-                            `\nDeadline: `
-                            +
-                            reminder.deadline
-
-                    }
-                );
-
-
-                localStorage.setItem(
-                    key,
-                    "true"
-                );
-
 
                 showToast(
                     "🔔 Reminder: " +
                     reminder.title
                 );
 
+                localStorage.setItem(
+                    key,
+                    "true"
+                );
             }
         );
 
-    }
-
-    catch (error) {
+    } catch (error) {
 
         console.error(
-            "Reminder error:",
+            "Reminder check error:",
             error
         );
-
     }
-
 }
 
 
@@ -3966,6 +4382,12 @@ function escapeHtml(
 // ============================================================
 
 loadTheme();
+
+if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(
+        error => console.error("Service worker registration failed:", error)
+    );
+}
 
 loadAssignments();
 
