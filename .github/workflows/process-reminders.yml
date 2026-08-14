@@ -1,0 +1,18 @@
+name: AssignmentFlow Reminders
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  process-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Process due reminders
+        env:
+          REMINDER_CRON_SECRET: ${{ secrets.REMINDER_CRON_SECRET }}
+        run: |
+          curl --fail --silent --show-error \
+            -H "X-Cron-Secret: ${REMINDER_CRON_SECRET}" \
+            https://assignmentflow.onrender.com/api/process-reminders
